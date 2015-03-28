@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"path"
@@ -10,36 +11,35 @@ import (
 )
 
 type Plugin struct {
-	client       *etcd.Client
 	Name         string
-	eventsChan   chan string
-	watchChan    chan *etcd.Response
-	stopChan     chan bool
-	handler      Handler
 	ReplayUnseen bool
+
+	client    *etcd.Client
+	watchChan chan *etcd.Response
+	stopChan  chan bool
+
+	deployEventsChan chan *DeployEvent
+	deployHandler    DeployHandler
 }
 
-type Handler interface {
-	Handle(string)
+type DeployHandler interface {
+	Handle(*DeployEvent)
 }
 
 func New(name string, client *etcd.Client) *Plugin {
-	watchChan := make(chan *etcd.Response, 100)
-	eventsChan := make(chan string, 100)
-	stopChan := make(chan bool)
-
 	return &Plugin{
-		Name:         name,
-		eventsChan:   eventsChan,
-		watchChan:    watchChan,
-		stopChan:     stopChan,
-		client:       client,
-		ReplayUnseen: false,
+		Name:             name,
+		deployEventsChan: make(chan *DeployEvent, 100),
+		watchChan:        make(chan *etcd.Response, 100),
+		stopChan:         make(chan bool),
+		client:           client,
+		ReplayUnseen:     false,
 	}
 }
 
-func (p *Plugin) SetHandler(newHandler Handler) {
-	p.handler = newHandler
+func (p *Plugin) SetDeployHandler(newHandler DeployHandler) {
+	p.deployHandler = newHandler
+	return
 }
 
 func (p *Plugin) Run() error {
@@ -57,8 +57,8 @@ func (p *Plugin) loop() {
 		select {
 		case w := <-p.watchChan:
 			p.send(w.Node)
-		case e := <-p.eventsChan:
-			p.handler.Handle(e)
+		case e := <-p.deployEventsChan:
+			p.deployHandler.Handle(e)
 		}
 	}
 }
@@ -85,10 +85,15 @@ func (p *Plugin) watch() error {
 
 func (p *Plugin) send(node *etcd.Node) {
 	timestamp := keyToTimestamp(node.Key)
-	event := node.Value
+	eventType := path.Base(path.Dir(node.Key))
+	event := structForEventType(eventType)
+	json.Unmarshal([]byte(node.Value), &event)
 
 	if timestamp != 0 && timestamp > p.LastSeen() {
-		p.eventsChan <- event
+		switch eventType {
+		case "deploy":
+			p.deployEventsChan <- event.(*DeployEvent)
+		}
 		p.UpdateLastSeen(timestamp)
 	}
 	return
@@ -120,4 +125,12 @@ func keyToTimestamp(timestamp string) uint32 {
 	}
 
 	return uint32(conv)
+}
+
+func structForEventType(eventType string) interface{} {
+	switch eventType {
+	case "deploy":
+		return new(DeployEvent)
+	}
+	return nil
 }
